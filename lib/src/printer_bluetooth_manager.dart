@@ -8,7 +8,6 @@
 
 import 'dart:async';
 import 'dart:io';
-import 'package:esc_pos_utils/esc_pos_utils.dart';
 import 'package:rxdart/rxdart.dart';
 import 'package:flutter_bluetooth_basic/flutter_bluetooth_basic.dart';
 import './enums.dart';
@@ -31,6 +30,10 @@ class PrinterBluetoothManager {
   StreamSubscription? _scanResultsSubscription;
   StreamSubscription? _isScanningSubscription;
   PrinterBluetooth? _selectedPrinter;
+  List<int> _bufferedBytes = [];
+  int _queueSleepTimeMs = 20;
+  int _chunkSizeBytes = 20;
+  int _connectionTimeOut = 10;
 
   final BehaviorSubject<bool> _isScanning = BehaviorSubject.seeded(false);
   Stream<bool> get isScanningStream => _isScanning.stream;
@@ -41,6 +44,88 @@ class PrinterBluetoothManager {
 
   Future _runDelayed(int seconds) {
     return Future<dynamic>.delayed(Duration(seconds: seconds));
+  }
+
+  Future<PosPrintResult> printLabel(List<int>? bytes,
+      {int chunkSizeBytes = 20,
+      int queueSleepTimeMs = 20,
+      int timeout = 5,
+      int connectionTimeOut = 10}) async {
+    if (bytes == null || bytes.isEmpty) {
+      return Future<PosPrintResult>.value(PosPrintResult.ticketEmpty);
+    }
+    _bufferedBytes = [];
+    _bufferedBytes = bytes;
+    _queueSleepTimeMs = queueSleepTimeMs;
+    _chunkSizeBytes = chunkSizeBytes;
+    _connectionTimeOut = connectionTimeOut;
+    if (_isConnected) {
+      return await _writeRequest(timeout);
+    } else {
+      final result = await connect(bytes, timeout);
+      if (result.msg == "Success") {
+        return await _writeRequest(timeout);
+      } else {
+        return result;
+      }
+    }
+  }
+
+  Future<PosPrintResult> _checkConnectionState() async {
+    Timer? _stateTimer;
+    int _start = _connectionTimeOut;
+    final Completer<PosPrintResult> completer = Completer();
+    const oneSec = Duration(seconds: 1);
+    _stateTimer = Timer.periodic(
+      oneSec,
+      (Timer timer) {
+        if (_start == 0 || _isConnected) {
+          timer.cancel();
+          print('ENDTIME');
+          print(_isConnected);
+          if (_isConnected) {
+            _stateTimer?.cancel();
+            completer.complete(PosPrintResult.success);
+          } else {
+            _stateTimer?.cancel();
+            completer.complete(PosPrintResult.timeout);
+          }
+        } else {
+          _start--;
+        }
+      },
+    );
+    return completer.future;
+  }
+
+  Future<PosPrintResult> _connectBluetooth(
+    List<int> bytes, {
+    int timeout = 5,
+  }) async {
+    if (_selectedPrinter == null) {
+      return Future<PosPrintResult>.value(PosPrintResult.printerNotSelected);
+    } else if (_isScanning.value ?? false) {
+      return Future<PosPrintResult>.value(PosPrintResult.scanInProgress);
+    } else if (_isPrinting) {
+      return Future<PosPrintResult>.value(PosPrintResult.printInProgress);
+    }
+    // We have to rescan before connecting, otherwise we can connect only once
+    await _bluetoothManager.startScan(timeout: Duration(seconds: 1));
+    await _bluetoothManager.stopScan();
+    // Connect
+    await _bluetoothManager.connect(_selectedPrinter!._device);
+    final result = await _checkConnectionState();
+    return result;
+  }
+
+  Future<dynamic> connect(bytes, timeout) async {
+    print("CONNECTING ON PRINT");
+    print("CONNECTING ON PRINT");
+    final result = await _connectBluetooth(
+      bytes,
+      timeout: timeout,
+    );
+    return result;
   }
 
   void startScan(Duration timeout) async {
@@ -155,5 +240,35 @@ class PrinterBluetoothManager {
       chunkSizeBytes: chunkSizeBytes,
       queueSleepTimeMs: queueSleepTimeMs,
     );
+  }
+
+  Future<PosPrintResult> _writeRequest(timeout) async {
+    final Completer<PosPrintResult> completer = Completer();
+    if (_bufferedBytes.isNotEmpty) {
+      await _writePending();
+      _runDelayed(timeout).then((dynamic v) async {
+        if (_isPrinting) {
+          _isPrinting = false;
+        }
+        completer.complete(PosPrintResult.success);
+      });
+    }
+    return completer.future;
+  }
+
+  Future<void> _writePending() async {
+    final len = _bufferedBytes.length;
+    List<List<int>> chunks = [];
+    for (var i = 0; i < len; i += _chunkSizeBytes) {
+      var end = (i + _chunkSizeBytes < len) ? i + _chunkSizeBytes : len;
+      chunks.add(_bufferedBytes.sublist(i, end));
+    }
+    _isPrinting = true;
+    for (var i = 0; i < chunks.length; i += 1) {
+      await _bluetoothManager.writeData(chunks[i]);
+      sleep(Duration(milliseconds: _queueSleepTimeMs));
+    }
+    _isPrinting = false;
+    _bufferedBytes = [];
   }
 }
